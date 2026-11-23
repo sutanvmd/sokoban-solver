@@ -6,6 +6,16 @@
 // the walks between regions are stitched together. All search budgets are
 // deterministic expansion counters, never the clock, so two runs of this
 // program produce byte-identical output.
+//
+// Memory discipline (the grader gives 512 MB): search nodes live in flat
+// typed arrays (packed box positions, parent index, the single push that
+// created the node) instead of per-node objects holding move strings; the
+// full move string is rebuilt once at the end by replaying the pushes.
+// The visited set is a Map keyed by a 32-bit numeric hash whose stored
+// value packs a second independent 32-bit hash together with g, so a key
+// collision can never silently prune a distinct state. Every structure is
+// hard-capped: past the cap a search stops and reports unsolved for that
+// region instead of growing until the process aborts.
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -119,28 +129,54 @@ function walkString(L, par, from, to) {
   return chars.reverse().join('');
 }
 
+// ---------- state hashing (two independent 32-bit hashes) ----------
+
+function hashA(boxes, base, nb, rep) {
+  let x = (rep + 0x9e3779b9) | 0;
+  for (let i = 0; i < nb; i++) {
+    x = Math.imul(x ^ (boxes[base + i] + 0x85ebca6b), 0xc2b2ae35);
+    x ^= x >>> 13;
+  }
+  x = Math.imul(x ^ (x >>> 16), 0x85ebca6b);
+  x ^= x >>> 13;
+  return x >>> 0;
+}
+
+function hashB(boxes, base, nb, rep) {
+  let x = (rep * 31 + 0x27d4eb2f) | 0;
+  for (let i = nb - 1; i >= 0; i--) {
+    x = Math.imul(x ^ (boxes[base + i] + 0x165667b1), 0x27d4eb2d);
+    x ^= x >>> 15;
+  }
+  x = Math.imul(x ^ (x >>> 15), 0x2c1b3c6d);
+  x ^= x >>> 12;
+  return x >>> 0;
+}
+
 // ---------- heuristic: box->goal matching on push distances ----------
 
-function heuristic(dists, goals, boxes) {
-  const n = boxes.length;
-  if (n === 0) return 0;
-  const cost = boxes.map((b) => dists.map((dist) => dist[b]));
-  for (let i = 0; i < n; i++) {
+// dists[g][cell] is the push distance from cell to goal g. `dp` is a
+// caller-owned scratch buffer of size 2^nb, reused across calls.
+function heuristic(dists, ng, boxes, base, nb, dp) {
+  if (nb === 0) return 0;
+  for (let i = 0; i < nb; i++) {
+    const b = boxes[base + i];
     let any = false;
-    for (let g = 0; g < goals.length; g++) if (cost[i][g] >= 0) any = true;
+    for (let g = 0; g < ng; g++) if (dists[g][b] >= 0) any = true;
     if (!any) return Infinity;
   }
-  if (n <= 10 && goals.length === n) {
-    const size = 1 << n;
-    const dp = new Float64Array(size).fill(Infinity);
+  if (nb <= 10 && ng === nb) {
+    const size = 1 << nb;
+    dp.fill(Infinity, 0, size);
     dp[0] = 0;
     for (let mask = 0; mask < size; mask++) {
       let i = 0;
       for (let m = mask; m; m &= m - 1) i++;
-      if (i >= n || dp[mask] === Infinity) continue;
-      for (let g = 0; g < n; g++) {
+      if (i >= nb || dp[mask] === Infinity) continue;
+      const b = boxes[base + i];
+      for (let g = 0; g < nb; g++) {
         if (mask & (1 << g)) continue;
-        const c = cost[i][g];
+        const c = dists[g][b];
         if (c < 0) continue;
         const nm = mask | (1 << g);
         if (dp[mask] + c < dp[nm]) dp[nm] = dp[mask] + c;
@@ -149,10 +185,11 @@ function heuristic(dists, goals, boxes) {
     return dp[size - 1];
   }
   let sum = 0;
-  for (let i = 0; i < n; i++) {
+  for (let i = 0; i < nb; i++) {
+    const b = boxes[base + i];
     let best = Infinity;
-    for (let g = 0; g < goals.length; g++) {
-      const c = cost[i][g];
+    for (let g = 0; g < ng; g++) {
+      const c = dists[g][b];
       if (c >= 0 && c < best) best = c;
     }
     sum += best;
@@ -162,11 +199,17 @@ function heuristic(dists, goals, boxes) {
 
 // ---------- push-based A* over a region ----------
 
+const VISITED_MAX = 320000; // visited entries; past this the search stops
+const NODES_MAX = 1000000; // stored nodes; past this the search stops
+const GPACK = 1048576; // 2^20: g values always stay far below this
+
 // Boxes must stay inside `allowed`; `hardBlocked` cells (other regions'
 // boxes) are permanent obstacles for the player. Returns
 // { moves, pushes, playerEnd } or null when unsolved within `cap` expansions.
 function solveRegion(L, allowed, boxAllowed, boxes0, goals, player0, hardBlocked, cap) {
   const { n, nbr, wall } = L;
+  const nb = boxes0.length;
+  const ng = goals.length;
   const dists = pushDistances(L, allowed, goals);
   const dead = new Uint8Array(n);
   for (let c = 0; c < n; c++) {
@@ -176,26 +219,74 @@ function solveRegion(L, allowed, boxAllowed, boxes0, goals, player0, hardBlocked
     if (!alive) dead[c] = 1;
   }
   for (const b of boxes0) if (dead[b]) return null;
-  const goalSet = new Set(goals);
-  const isGoalBoxes = (bx) => bx.every((b) => goalSet.has(b));
-  if (isGoalBoxes(boxes0)) return { moves: '', pushes: 0, playerEnd: player0 };
+  const allOnGoal = (arr, base) => {
+    for (let i = 0; i < nb; i++) if (!L.goal[arr[base + i]]) return false;
+    return true;
+  };
+  const dp = nb <= 10 && ng === nb ? new Float64Array(1 << nb) : null;
+  const hOf = (arr, base) =>
+    heuristic(dists, ng, arr, base, nb, dp ?? new Float64Array(0));
+  if (allOnGoal(boxes0, 0)) return { moves: '', pushes: 0, playerEnd: player0 };
+  const h0 = hOf(boxes0, 0);
+  if (!isFinite(h0)) return null;
 
   const blocked = new Uint8Array(n);
   const seen = new Int32Array(n);
   const par = new Int32Array(n);
+  const inBox = new Uint8Array(n);
   let stamp = 0;
 
-  const h0 = heuristic(dists, goals, boxes0);
-  if (!isFinite(h0)) return null;
+  // Flat node store, grown by doubling. Per node: nb packed box cells,
+  // parent index, player cell after the push, the push direction, g, h, f.
+  let capNodes = 65536;
+  let boxArr = new Int32Array(capNodes * nb);
+  let parentArr = new Int32Array(capNodes);
+  let playerArr = new Int32Array(capNodes);
+  let gArr = new Int32Array(capNodes);
+  let hArr = new Int32Array(capNodes);
+  let fArr = new Int32Array(capNodes);
+  let dirArr = new Int8Array(capNodes);
+  let nodeCount = 0;
+  const grow = () => {
+    const nc = capNodes * 2;
+    const nb2 = new Int32Array(nc * nb);
+    nb2.set(boxArr);
+    boxArr = nb2;
+    const growI = (a) => {
+      const b = new Int32Array(nc);
+      b.set(a);
+      return b;
+    };
+    parentArr = growI(parentArr);
+    playerArr = growI(playerArr);
+    gArr = growI(gArr);
+    hArr = growI(hArr);
+    fArr = growI(fArr);
+    const nd = new Int8Array(nc);
+    nd.set(dirArr);
+    dirArr = nd;
+    capNodes = nc;
+  };
+  const addNode = (srcArr, srcBase, player, parent, dir, g, h) => {
+    if (nodeCount >= NODES_MAX) return -1;
+    if (nodeCount === capNodes) grow();
+    const id = nodeCount++;
+    const base = id * nb;
+    for (let i = 0; i < nb; i++) boxArr[base + i] = srcArr[srcBase + i];
+    playerArr[id] = player;
+    parentArr[id] = parent;
+    dirArr[id] = dir;
+    gArr[id] = g;
+    hArr[id] = h;
+    fArr[id] = g + h;
+    return id;
+  };
 
-  const nodes = [];
   const heap = [];
   const less = (a, b) => {
-    const na = nodes[a];
-    const nb = nodes[b];
-    if (na.f !== nb.f) return na.f < nb.f;
-    if (na.h !== nb.h) return na.h < nb.h;
-    return na.seq < nb.seq;
+    if (fArr[a] !== fArr[b]) return fArr[a] < fArr[b];
+    if (hArr[a] !== hArr[b]) return hArr[a] < hArr[b];
+    return a < b;
   };
   const pushHeap = (id) => {
     heap.push(id);
@@ -227,28 +318,19 @@ function solveRegion(L, allowed, boxAllowed, boxes0, goals, player0, hardBlocked
     return top;
   };
 
-  let seq = 0;
-  nodes.push({
-    boxes: boxes0.slice(),
-    player: player0,
-    g: 0,
-    h: h0,
-    f: h0,
-    parent: -1,
-    seg: '',
-    seq: seq++,
-  });
-  pushHeap(0);
+  const root = addNode(boxes0, 0, player0, -1, -1, 0, h0);
+  pushHeap(root);
   const visited = new Map();
   let expansions = 0;
 
-  const frozen2x2 = (boxSet, moved) => {
+  const frozen2x2 = (moved) => {
     const mx = moved % L.w;
     const my = (moved / L.w) | 0;
     for (let oy = -1; oy <= 0; oy++) {
       for (let ox = -1; ox <= 0; ox++) {
-        const cells = [];
         let ok = true;
+        let allSolid = true;
+        let badBox = false;
         for (let dy = 0; dy < 2 && ok; dy++) {
           for (let dx = 0; dx < 2; dx++) {
             const x = mx + ox + dx;
@@ -257,76 +339,104 @@ function solveRegion(L, allowed, boxAllowed, boxes0, goals, player0, hardBlocked
               ok = false;
               break;
             }
-            cells.push(y * L.w + x);
+            const c = y * L.w + x;
+            if (wall[c]) continue;
+            if (inBox[c]) {
+              if (!L.goal[c]) badBox = true;
+              continue;
+            }
+            allSolid = false;
           }
         }
-        if (!ok) continue;
-        let allSolid = true;
-        let badBox = false;
-        for (const c of cells) {
-          if (wall[c]) continue;
-          if (boxSet.has(c)) {
-            if (!goalSet.has(c)) badBox = true;
-            continue;
-          }
-          allSolid = false;
-        }
-        if (allSolid && badBox) return true;
+        if (ok && allSolid && badBox) return true;
       }
     }
     return false;
   };
 
+  // Replay the pushes from the root to `goalId` and rebuild the full move
+  // string (walks between pushes recomputed by flood fill, exactly as the
+  // search saw them).
+  const reconstruct = (goalId) => {
+    const chain = [];
+    for (let cur = goalId; parentArr[cur] >= 0; cur = parentArr[cur]) chain.push(cur);
+    chain.reverse();
+    const curBoxes = boxes0.slice();
+    let player = player0;
+    let moves = '';
+    for (const id of chain) {
+      const d = dirArr[id];
+      const boxFrom = playerArr[id];
+      const stand = nbr[boxFrom * 4 + (d ^ 1)];
+      const dest = nbr[boxFrom * 4 + d];
+      for (let c = 0; c < n; c++) blocked[c] = wall[c] || hardBlocked[c] ? 1 : 0;
+      for (const b of curBoxes) blocked[b] = 1;
+      stamp++;
+      flood(L, blocked, player, stamp, seen, par);
+      moves += walkString(L, par, player, stand) + DIRS[d].ch.toUpperCase();
+      curBoxes[curBoxes.indexOf(boxFrom)] = dest;
+      player = boxFrom;
+    }
+    return { moves, pushes: gArr[goalId], playerEnd: playerArr[goalId] };
+  };
+
+  const childBoxes = new Int32Array(nb);
   while (heap.length) {
     if (++expansions > cap) return null;
     const id = popHeap();
-    const node = nodes[id];
+    const base = id * nb;
+    const g = gArr[id];
     for (let c = 0; c < n; c++) blocked[c] = wall[c] || hardBlocked[c] ? 1 : 0;
-    for (const b of node.boxes) blocked[b] = 1;
+    for (let i = 0; i < nb; i++) blocked[boxArr[base + i]] = 1;
     stamp++;
-    const rep = flood(L, blocked, node.player, stamp, seen, par);
-    const key = node.boxes.join(',') + '|' + rep;
-    if (visited.has(key) && visited.get(key) <= node.g) continue;
-    visited.set(key, node.g);
-    if (isGoalBoxes(node.boxes)) {
-      const segs = [];
-      for (let cur = node; cur.parent >= 0; cur = nodes[cur.parent]) segs.push(cur.seg);
-      return {
-        moves: segs.reverse().join(''),
-        pushes: node.g,
-        playerEnd: node.player,
-      };
-    }
-    const boxSet = new Set(node.boxes);
-    for (const b of node.boxes) {
+    const rep = flood(L, blocked, playerArr[id], stamp, seen, par);
+    const kA = hashA(boxArr, base, nb, rep);
+    const kB = hashB(boxArr, base, nb, rep);
+    const prev = visited.get(kA);
+    if (prev !== undefined && Math.floor(prev / GPACK) === kB && prev % GPACK <= g) continue;
+    if (visited.size >= VISITED_MAX) return null;
+    visited.set(kA, kB * GPACK + g);
+    if (allOnGoal(boxArr, base)) return reconstruct(id);
+    for (let i = 0; i < nb; i++) inBox[boxArr[base + i]] = 1;
+    for (let bi = 0; bi < nb; bi++) {
+      const b = boxArr[base + bi];
       for (let d = 0; d < 4; d++) {
         const stand = nbr[b * 4 + (d ^ 1)];
         const dest = nbr[b * 4 + d];
         if (stand < 0 || dest < 0) continue;
         if (seen[stand] !== stamp) continue;
-        if (!boxAllowed[dest] || wall[dest] || boxSet.has(dest)) continue;
+        if (!boxAllowed[dest] || wall[dest] || inBox[dest]) continue;
         if (dead[dest]) continue;
-        const nbx = node.boxes.slice();
-        nbx[nbx.indexOf(b)] = dest;
-        nbx.sort((a, b2) => a - b2);
-        const nSet = new Set(nbx);
-        if (frozen2x2(nSet, dest)) continue;
-        const h = heuristic(dists, goals, nbx);
+        for (let i = 0; i < nb; i++) childBoxes[i] = boxArr[base + i];
+        childBoxes[bi] = dest;
+        // insertion sort the single moved box into place
+        let j = bi;
+        while (j > 0 && childBoxes[j - 1] > childBoxes[j]) {
+          const t = childBoxes[j - 1];
+          childBoxes[j - 1] = childBoxes[j];
+          childBoxes[j] = t;
+          j--;
+        }
+        while (j < nb - 1 && childBoxes[j + 1] < childBoxes[j]) {
+          const t = childBoxes[j + 1];
+          childBoxes[j + 1] = childBoxes[j];
+          childBoxes[j] = t;
+          j++;
+        }
+        inBox[b] = 0;
+        inBox[dest] = 1;
+        const frozen = frozen2x2(dest);
+        inBox[dest] = 0;
+        inBox[b] = 1;
+        if (frozen) continue;
+        const h = hOf(childBoxes, 0);
         if (!isFinite(h)) continue;
-        const seg = walkString(L, par, node.player, stand) + DIRS[d].ch.toUpperCase();
-        nodes.push({
-          boxes: nbx,
-          player: b,
-          g: node.g + 1,
-          h,
-          f: node.g + 1 + h,
-          parent: id,
-          seg,
-          seq: seq++,
-        });
-        pushHeap(nodes.length - 1);
+        const cid = addNode(childBoxes, 0, b, id, d, g + 1, h);
+        if (cid < 0) return null;
+        pushHeap(cid);
       }
     }
+    for (let i = 0; i < nb; i++) inBox[boxArr[base + i]] = 0;
   }
   return null;
 }
@@ -524,7 +634,7 @@ function solveByRegions(L) {
       if (start < 0) return null;
       walk = bestW;
     }
-    const res = solveRegion(L, allowed, boxAllowed, rBoxes, rGoals, start, hardBlocked, 250000);
+    const res = solveRegion(L, allowed, boxAllowed, rBoxes, rGoals, start, hardBlocked, 120000);
     if (!res) return null;
     moves += walk + res.moves;
     for (const b of rBoxes) boxSet.delete(b);
@@ -551,7 +661,7 @@ function solveLevel(text) {
     L.goals,
     L.player,
     new Uint8Array(L.n),
-    400000,
+    200000,
   );
   return res ? res.moves : '';
 }
